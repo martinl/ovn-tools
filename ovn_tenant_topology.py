@@ -35,6 +35,7 @@ Usage:
 
   # Formats: tree, ascii, table, json, dot, mermaid
   python3 ovn_tenant_topology.py --format ascii
+  python3 ovn_tenant_topology.py --format table
   python3 ovn_tenant_topology.py --format json
   python3 ovn_tenant_topology.py --format dot | dot -Tsvg -o topology.svg
 
@@ -53,6 +54,35 @@ import os
 import re
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+# ==============================================================================
+# Domain Exceptions
+# ==============================================================================
+
+class TopologyError(Exception):
+    """Base exception for topology errors."""
+    pass
+
+
+class OpenStackSDKMissingError(TopologyError):
+    """Raised when openstacksdk is not installed."""
+    pass
+
+
+class ConnectionConfigError(TopologyError):
+    """Raised when openstack connection configuration fails."""
+    pass
+
+
+class ProjectNotFoundError(TopologyError):
+    """Raised when a specified project cannot be found."""
+    pass
+
+
+class TopologyQueryError(TopologyError):
+    """Raised when an OpenStack API query fails."""
+    pass
 
 
 # ==============================================================================
@@ -216,6 +246,26 @@ class Colors:
 
 
 # ==============================================================================
+# Helper Sanitizers & Escaping
+# ==============================================================================
+
+def _safe_id(prefix: str, raw_id: str) -> str:
+    """Creates a syntax-safe identifier for Graphviz DOT and Mermaid."""
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", str(raw_id))
+    return f"{prefix}_{sanitized}"
+
+
+def _dot_escape(text: str) -> str:
+    """Escapes strings for Graphviz DOT label attributes."""
+    return str(text).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _mermaid_escape(text: str) -> str:
+    """Escapes strings for Mermaid node labels."""
+    return str(text).replace('"', "'")
+
+
+# ==============================================================================
 # Topology Graph Engine
 # ==============================================================================
 
@@ -230,6 +280,7 @@ def build_topology_from_data(
     project_name: str,
     auth_url: str = "",
     region_name: str = "",
+    all_external: bool = False,
 ) -> Topology:
     """Reconciles OpenStack resource lists into a connected topology graph."""
 
@@ -361,6 +412,22 @@ def build_topology_from_data(
         )
         routers[r_id] = r_obj
 
+    # 5b. Filter external networks to only connected/active ones unless all_external is True
+    if not all_external and ext_networks:
+        connected_ext_ids: Set[str] = {
+            r.external_network_id for r in routers.values() if r.external_network_id
+        }
+        for fip in raw_floating_ips:
+            fip_net_id = fip.get("floating_network_id")
+            if fip_net_id:
+                connected_ext_ids.add(fip_net_id)
+
+        filtered_ext = {
+            nid: net for nid, net in ext_networks.items() if nid in connected_ext_ids
+        }
+        if filtered_ext:
+            ext_networks = filtered_ext
+
     # 6. Process Compute Instances (Servers)
     servers: Dict[str, ServerInfo] = {}
     for s in raw_servers:
@@ -417,14 +484,18 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
     lines.append(colors.bold_cyan("=" * 78))
     lines.append("")
 
-    # Map subnets to instances
-    subnet_vms: Dict[str, List[Tuple[ServerInfo, PortInfo, str]]] = defaultdict(list)
+    # Map subnets to instances (grouping IPs per port on that subnet)
+    subnet_vms: Dict[str, List[Tuple[ServerInfo, PortInfo, List[str]]]] = defaultdict(list)
     for s in topo.servers.values():
         for p in s.ports:
+            ips_by_sn: Dict[str, List[str]] = defaultdict(list)
             for fip in p.fixed_ips:
                 sn_id = fip.get("subnet_id", "")
                 ip_addr = fip.get("ip_address", "")
-                subnet_vms[sn_id].append((s, p, ip_addr))
+                if sn_id and ip_addr:
+                    ips_by_sn[sn_id].append(ip_addr)
+            for sn_id, ip_list in ips_by_sn.items():
+                subnet_vms[sn_id].append((s, p, ip_list))
 
     # Map External Network -> Routers
     ext_routers: Dict[str, List[RouterInfo]] = defaultdict(list)
@@ -446,6 +517,8 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
             )
 
             c_routers = ext_routers.get(ext_id, [])
+            if not c_routers:
+                lines.append(f"    └── {colors.dim('(no tenant routers attached)')}")
             for r_idx, r in enumerate(c_routers):
                 is_last_r = (r_idx == len(c_routers) - 1)
                 r_prefix = "└── " if is_last_r else "├── "
@@ -477,6 +550,12 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
 
                     cidr = sn_obj.cidr if sn_obj else "unknown CIDR"
                     gw_ip = sn_obj.gateway_ip if sn_obj else iface.ip_address
+
+                    encap_str = ""
+                    if t_net and t_net.network_type:
+                        seg = f":{t_net.segmentation_id}" if t_net.segmentation_id else ""
+                        encap_str = f" [{t_net.network_type}{seg}]"
+
                     ovn_ls_str = (
                         f" [{colors.magenta('OVN LS:')} {t_net.ovn_logical_switch}]"
                         if (ovn_details and t_net)
@@ -485,14 +564,14 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
 
                     lines.append(
                         f"{i_prefix}🔌 {colors.bold_green('Subnet:')} {net_name} / {cidr} "
-                        f"(GW: {gw_ip}){ovn_ls_str}"
+                        f"(GW: {gw_ip}){encap_str}{ovn_ls_str}"
                     )
 
                     vms_in_sn = subnet_vms.get(iface.subnet_id, [])
                     if not vms_in_sn:
                         lines.append(f"{i_indent}└── {colors.dim('(no compute instances attached)')}")
                     else:
-                        for vm_idx, (vm, port, ip) in enumerate(vms_in_sn):
+                        for vm_idx, (vm, port, ips) in enumerate(vms_in_sn):
                             is_last_vm = (vm_idx == len(vms_in_sn) - 1)
                             vm_prefix = i_indent + ("└── " if is_last_vm else "├── ")
 
@@ -500,10 +579,23 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
                             if port.floating_ip:
                                 fip_str = f" ➜ 🌐 {colors.bold_cyan('Floating IP:')} {colors.bold(port.floating_ip)}"
 
-                            mac_str = f" ({colors.dim(port.mac_address)})" if verbose else ""
+                            details_parts = []
+                            if verbose and port.mac_address:
+                                details_parts.append(f"MAC: {port.mac_address}")
+                            if verbose and port.security_groups:
+                                details_parts.append(f"SG: {', '.join(port.security_groups)}")
+                            if ovn_details and port.id:
+                                details_parts.append(f"LSP: {port.id[:8]}")
+                            details_str = f" ({colors.dim(', '.join(details_parts))})" if details_parts else ""
+
+                            status_str = colors.status_badge(vm.status)
+                            if vm.task_state:
+                                status_str += f" {colors.yellow(f'({vm.task_state})')}"
+
+                            ips_str = ", ".join(ips)
                             lines.append(
-                                f"{vm_prefix}🖥️  {colors.bold(vm.name)} {colors.status_badge(vm.status)} "
-                                f"[{ip}]{mac_str}{fip_str}"
+                                f"{vm_prefix}🖥️  {colors.bold(vm.name)} {status_str} "
+                                f"[{ips_str}]{details_str}{fip_str}"
                             )
             lines.append("")
     else:
@@ -513,12 +605,79 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
     # 2. Render Unattached Routers
     if unattached_routers:
         lines.append(colors.bold_yellow("🔀 Internal / Disconnected Routers:"))
-        for r in unattached_routers:
-            lines.append(f"└── 🔀 Router: {r.name} {colors.status_badge(r.status)} (No External Gateway)")
-            for iface in r.interfaces:
+        for r_idx, r in enumerate(unattached_routers):
+            is_last_r = (r_idx == len(unattached_routers) - 1)
+            r_prefix = "└── " if is_last_r else "├── "
+            r_indent = "    " if is_last_r else "│   "
+
+            ovn_lr_str = f" [{colors.magenta('OVN LR:')} {r.ovn_logical_router}]" if ovn_details else ""
+            lines.append(
+                f"{r_prefix}🔀 {colors.bold_yellow('Router:')} {colors.bold(r.name)} "
+                f"{colors.status_badge(r.status)} (No External Gateway){ovn_lr_str}"
+            )
+            for i_idx, iface in enumerate(r.interfaces):
+                is_last_i = (i_idx == len(r.interfaces) - 1)
+                i_prefix = r_indent + ("└── " if is_last_i else "├── ")
+                i_indent = r_indent + ("    " if is_last_i else "│   ")
+
                 t_net = topo.tenant_networks.get(iface.network_id)
                 net_name = t_net.name if t_net else iface.network_id[:8]
-                lines.append(f"    └── 🔌 Interface: {net_name} ({iface.ip_address})")
+                sn_obj = None
+                if t_net:
+                    for s_candidate in t_net.subnets:
+                        if s_candidate.id == iface.subnet_id:
+                            sn_obj = s_candidate
+                            break
+
+                cidr = sn_obj.cidr if sn_obj else "unknown CIDR"
+                gw_ip = sn_obj.gateway_ip if sn_obj else iface.ip_address
+
+                encap_str = ""
+                if t_net and t_net.network_type:
+                    seg = f":{t_net.segmentation_id}" if t_net.segmentation_id else ""
+                    encap_str = f" [{t_net.network_type}{seg}]"
+
+                ovn_ls_str = (
+                    f" [{colors.magenta('OVN LS:')} {t_net.ovn_logical_switch}]"
+                    if (ovn_details and t_net)
+                    else ""
+                )
+
+                lines.append(
+                    f"{i_prefix}🔌 {colors.bold_green('Subnet:')} {net_name} / {cidr} "
+                    f"(GW: {gw_ip}){encap_str}{ovn_ls_str}"
+                )
+
+                vms_in_sn = subnet_vms.get(iface.subnet_id, [])
+                if not vms_in_sn:
+                    lines.append(f"{i_indent}└── {colors.dim('(no compute instances attached)')}")
+                else:
+                    for vm_idx, (vm, port, ips) in enumerate(vms_in_sn):
+                        is_last_vm = (vm_idx == len(vms_in_sn) - 1)
+                        vm_prefix = i_indent + ("└── " if is_last_vm else "├── ")
+
+                        fip_str = ""
+                        if port.floating_ip:
+                            fip_str = f" ➜ 🌐 {colors.bold_cyan('Floating IP:')} {colors.bold(port.floating_ip)}"
+
+                        details_parts = []
+                        if verbose and port.mac_address:
+                            details_parts.append(f"MAC: {port.mac_address}")
+                        if verbose and port.security_groups:
+                            details_parts.append(f"SG: {', '.join(port.security_groups)}")
+                        if ovn_details and port.id:
+                            details_parts.append(f"LSP: {port.id[:8]}")
+                        details_str = f" ({colors.dim(', '.join(details_parts))})" if details_parts else ""
+
+                        status_str = colors.status_badge(vm.status)
+                        if vm.task_state:
+                            status_str += f" {colors.yellow(f'({vm.task_state})')}"
+
+                        ips_str = ", ".join(ips)
+                        lines.append(
+                            f"{vm_prefix}🖥️  {colors.bold(vm.name)} {status_str} "
+                            f"[{ips_str}]{details_str}{fip_str}"
+                        )
         lines.append("")
 
     # 3. Render Isolated / Unrouted Networks
@@ -526,19 +685,34 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
         lines.append(colors.bold_magenta("📦 Isolated / Unrouted Networks (No Router Interface):"))
         for net_id, net in topo.isolated_networks.items():
             subnets_str = ", ".join(f"{sn.name} ({sn.cidr})" for sn in net.subnets) or "No Subnets"
+            encap_str = ""
+            if net.network_type:
+                seg = f":{net.segmentation_id}" if net.segmentation_id else ""
+                encap_str = f" [{net.network_type}{seg}]"
             ovn_ls_str = f" [{colors.magenta('OVN LS:')} {net.ovn_logical_switch}]" if ovn_details else ""
             lines.append(
                 f"└── 🔌 {colors.bold_magenta('Network:')} {net.name} {colors.status_badge(net.status)} "
-                f"[{subnets_str}]{ovn_ls_str}"
+                f"[{subnets_str}]{encap_str}{ovn_ls_str}"
             )
 
             has_vms = False
             for sn in net.subnets:
                 vms_in_sn = subnet_vms.get(sn.id, [])
-                for vm, port, ip in vms_in_sn:
+                for vm, port, ips in vms_in_sn:
                     has_vms = True
+                    status_str = colors.status_badge(vm.status)
+                    if vm.task_state:
+                        status_str += f" {colors.yellow(f'({vm.task_state})')}"
+                    ips_str = ", ".join(ips)
+                    details_parts = []
+                    if verbose and port.mac_address:
+                        details_parts.append(f"MAC: {port.mac_address}")
+                    if verbose and port.security_groups:
+                        details_parts.append(f"SG: {', '.join(port.security_groups)}")
+                    details_str = f" ({colors.dim(', '.join(details_parts))})" if details_parts else ""
+
                     lines.append(
-                        f"    └── 🖥️  {colors.bold(vm.name)} {colors.status_badge(vm.status)} [{ip}]"
+                        f"    └── 🖥️  {colors.bold(vm.name)} {status_str} [{ips_str}]{details_str}"
                     )
             if not has_vms:
                 lines.append(f"    └── {colors.dim('(no compute instances attached)')}")
@@ -547,17 +721,32 @@ def render_tree(topo: Topology, colors: Colors, ovn_details: bool = False, verbo
     return "\n".join(lines)
 
 
-def render_ascii(topo: Topology, ovn_details: bool = False) -> str:
+def render_ascii(topo: Topology, ovn_details: bool = False, verbose: bool = False) -> str:
     """Renders topology as clean plain-text ASCII suitable for logs and scripts."""
     lines: List[str] = []
     lines.append(f"=== OpenStack Tenant Topology: {topo.project_name} ({topo.project_id}) ===")
+    if topo.region_name or topo.auth_url:
+        reg = topo.region_name or "N/A"
+        auth = topo.auth_url or "N/A"
+        lines.append(f"Region: {reg} | Auth URL: {auth}")
     lines.append("")
 
-    subnet_vms: Dict[str, List[Tuple[ServerInfo, PortInfo, str]]] = defaultdict(list)
+    subnet_vms: Dict[str, List[Tuple[ServerInfo, PortInfo, List[str]]]] = defaultdict(list)
     for s in topo.servers.values():
         for p in s.ports:
+            ips_by_sn: Dict[str, List[str]] = defaultdict(list)
             for fip in p.fixed_ips:
-                subnet_vms[fip.get("subnet_id", "")].append((s, p, fip.get("ip_address", "")))
+                sn_id = fip.get("subnet_id", "")
+                ip_addr = fip.get("ip_address", "")
+                if sn_id and ip_addr:
+                    ips_by_sn[sn_id].append(ip_addr)
+            for sn_id, ip_list in ips_by_sn.items():
+                subnet_vms[sn_id].append((s, p, ip_list))
+
+    unattached_routers: List[RouterInfo] = []
+    for r in topo.routers.values():
+        if not r.external_network_id or r.external_network_id not in topo.external_networks:
+            unattached_routers.append(r)
 
     for ext_net in topo.external_networks.values():
         subnets_str = ", ".join(sn.cidr for sn in ext_net.subnets) or "no-subnets"
@@ -571,7 +760,8 @@ def render_ascii(topo: Topology, ovn_details: bool = False) -> str:
 
             gw = r.external_gateway_ip or "no-gw"
             snat = "snat:on" if r.enable_snat else "snat:off"
-            lines.append(f"{r_prefix}[ROUTER: {r.name}] [{r.status}] (GW: {gw}, {snat})")
+            ovn_lr = f" [OVN LR: {r.ovn_logical_router}]" if ovn_details else ""
+            lines.append(f"{r_prefix}[ROUTER: {r.name}] [{r.status}] (GW: {gw}, {snat}){ovn_lr}")
 
             for i_idx, iface in enumerate(r.interfaces):
                 is_last_i = (i_idx == len(r.interfaces) - 1)
@@ -580,38 +770,197 @@ def render_ascii(topo: Topology, ovn_details: bool = False) -> str:
 
                 t_net = topo.tenant_networks.get(iface.network_id)
                 net_name = t_net.name if t_net else iface.network_id[:8]
-                lines.append(f"{i_prefix}[SUBNET: {net_name}] (IP: {iface.ip_address})")
+                ovn_ls = f" [OVN LS: {t_net.ovn_logical_switch}]" if (ovn_details and t_net) else ""
+                lines.append(f"{i_prefix}[SUBNET: {net_name}] (IP: {iface.ip_address}){ovn_ls}")
 
                 vms = subnet_vms.get(iface.subnet_id, [])
-                for vm_idx, (vm, port, ip) in enumerate(vms):
+                for vm_idx, (vm, port, ips) in enumerate(vms):
                     is_last_vm = (vm_idx == len(vms) - 1)
                     vm_prefix = i_indent + ("\\-- " if is_last_vm else "+-- ")
                     fip_str = f" <=> [FIP: {port.floating_ip}]" if port.floating_ip else ""
-                    lines.append(f"{vm_prefix}[VM: {vm.name}] [{vm.status}] (IP: {ip}){fip_str}")
+                    mac_str = f" (MAC: {port.mac_address})" if verbose else ""
+                    sg_str = f" (SG: {', '.join(port.security_groups)})" if (verbose and port.security_groups) else ""
+                    task_str = f" ({vm.task_state})" if vm.task_state else ""
+                    ips_str = ", ".join(ips)
+                    lines.append(
+                        f"{vm_prefix}[VM: {vm.name}] [{vm.status}{task_str}] (IP: {ips_str}){mac_str}{sg_str}{fip_str}"
+                    )
+        lines.append("")
+
+    if unattached_routers:
+        lines.append("[INTERNAL ROUTERS]")
+        for r_idx, r in enumerate(unattached_routers):
+            ovn_lr = f" [OVN LR: {r.ovn_logical_router}]" if ovn_details else ""
+            lines.append(f"  +-- [ROUTER: {r.name}] [{r.status}] (No Gateway){ovn_lr}")
+            for iface in r.interfaces:
+                t_net = topo.tenant_networks.get(iface.network_id)
+                net_name = t_net.name if t_net else iface.network_id[:8]
+                ovn_ls = f" [OVN LS: {t_net.ovn_logical_switch}]" if (ovn_details and t_net) else ""
+                lines.append(f"      +-- [SUBNET: {net_name}] (IP: {iface.ip_address}){ovn_ls}")
+                vms = subnet_vms.get(iface.subnet_id, [])
+                for vm, port, ips in vms:
+                    ips_str = ", ".join(ips)
+                    mac_str = f" (MAC: {port.mac_address})" if verbose else ""
+                    task_str = f" ({vm.task_state})" if vm.task_state else ""
+                    lines.append(f"          +-- [VM: {vm.name}] [{vm.status}{task_str}] (IP: {ips_str}){mac_str}")
         lines.append("")
 
     if topo.isolated_networks:
         lines.append("[ISOLATED NETWORKS]")
         for net in topo.isolated_networks.values():
             subnets_str = ", ".join(sn.cidr for sn in net.subnets)
-            lines.append(f"  +-- [NET: {net.name}] ({subnets_str})")
+            ovn_ls = f" [OVN LS: {net.ovn_logical_switch}]" if ovn_details else ""
+            lines.append(f"  +-- [NET: {net.name}] ({subnets_str}){ovn_ls}")
             for sn in net.subnets:
-                for vm, port, ip in subnet_vms.get(sn.id, []):
-                    lines.append(f"      +-- [VM: {vm.name}] [{vm.status}] (IP: {ip})")
+                for vm, port, ips in subnet_vms.get(sn.id, []):
+                    ips_str = ", ".join(ips)
+                    mac_str = f" (MAC: {port.mac_address})" if verbose else ""
+                    sg_str = f" (SG: {', '.join(port.security_groups)})" if (verbose and port.security_groups) else ""
+                    task_str = f" ({vm.task_state})" if vm.task_state else ""
+                    lines.append(f"      +-- [VM: {vm.name}] [{vm.status}{task_str}] (IP: {ips_str}){mac_str}{sg_str}")
         lines.append("")
 
+    return "\n".join(lines)
+
+
+def render_table(topo: Topology, colors: Colors, verbose: bool = False) -> str:
+    """Renders topology as clean aligned ASCII tables (summary card and workload inventory)."""
+    lines: List[str] = []
+
+    # 1. Summary Card / Table
+    lines.append(colors.bold_cyan("=" * 88))
+    lines.append(
+        f"{colors.bold_cyan('OpenStack Tenant Network Topology Overview')} | "
+        f"Project: {colors.bold_yellow(topo.project_name)} ({colors.dim(topo.project_id)})"
+    )
+    if topo.region_name or topo.auth_url:
+        reg = topo.region_name or "N/A"
+        auth = topo.auth_url or "N/A"
+        lines.append(f"{colors.dim('Region:')} {reg} | {colors.dim('Auth URL:')} {auth}")
+    lines.append(colors.bold_cyan("=" * 88))
+    lines.append("")
+
+    # Summary Stats
+    total_ext = len(topo.external_networks)
+    total_routers = len(topo.routers)
+    total_tenant_nets = len(topo.tenant_networks)
+    total_isolated = len(topo.isolated_networks)
+    total_subnets = sum(len(n.subnets) for n in topo.tenant_networks.values())
+    total_servers = len(topo.servers)
+    total_fips = len(topo.floating_ips)
+
+    lines.append(colors.bold("RESOURCE SUMMARY:"))
+    summary_headers = ["Ext Nets", "Routers", "Tenant Nets", "Isolated Nets", "Subnets", "Instances", "Floating IPs"]
+    summary_values = [str(total_ext), str(total_routers), str(total_tenant_nets), str(total_isolated), str(total_subnets), str(total_servers), str(total_fips)]
+
+    col_w = [max(len(h), len(v)) + 2 for h, v in zip(summary_headers, summary_values)]
+    border = "+" + "+".join("-" * w for w in col_w) + "+"
+    hdr_row = "|" + "|".join(f" {h.center(w - 2)} " for h, w in zip(summary_headers, col_w)) + "|"
+    val_row = "|" + "|".join(f" {v.center(w - 2)} " for v, w in zip(summary_values, col_w)) + "|"
+
+    lines.append(border)
+    lines.append(hdr_row)
+    lines.append(border)
+    lines.append(val_row)
+    lines.append(border)
+    lines.append("")
+
+    # 2. Workload / Compute Inventory Table
+    lines.append(colors.bold("WORKLOAD INVENTORY & ROUTING PATH:"))
+
+    # Map subnet to Router
+    sn_to_router: Dict[str, RouterInfo] = {}
+    for r in topo.routers.values():
+        for iface in r.interfaces:
+            sn_to_router[iface.subnet_id] = r
+
+    # Map subnet ID to SubnetInfo & NetworkInfo
+    sn_map: Dict[str, Tuple[NetworkInfo, SubnetInfo]] = {}
+    for net in list(topo.tenant_networks.values()) + list(topo.external_networks.values()):
+        for sn in net.subnets:
+            sn_map[sn.id] = (net, sn)
+
+    rows: List[List[str]] = []
+    headers = ["Instance", "Status", "Fixed IP(s)", "Floating IP", "Network / CIDR", "Router Gateway"]
+    if verbose:
+        headers.extend(["MAC Address", "Security Groups"])
+
+    for s in sorted(topo.servers.values(), key=lambda x: x.name):
+        s_status = s.status + (f" ({s.task_state})" if s.task_state else "")
+        if not s.ports:
+            row = [s.name, s_status, "No Port", "-", "-", "None"]
+            if verbose:
+                row.extend(["-", "-"])
+            rows.append(row)
+            continue
+
+        for p in s.ports:
+            ips_by_sn: Dict[str, List[str]] = defaultdict(list)
+            for fip in p.fixed_ips:
+                ips_by_sn[fip.get("subnet_id", "")].append(fip.get("ip_address", ""))
+
+            fip_val = p.floating_ip or "-"
+            mac_val = p.mac_address or "-"
+            sg_val = ", ".join(p.security_groups) or "-"
+
+            if not ips_by_sn:
+                row = [s.name, s_status, "No IP", fip_val, "Unassigned", "None"]
+                if verbose:
+                    row.extend([mac_val, sg_val])
+                rows.append(row)
+                continue
+
+            for sn_id, ip_list in ips_by_sn.items():
+                ip_val = ", ".join(ip_list)
+                if sn_id in sn_map:
+                    net_obj, sn_obj = sn_map[sn_id]
+                    net_val = f"{net_obj.name} ({sn_obj.cidr})"
+                else:
+                    net_val = sn_id[:8] if sn_id else "-"
+
+                r_obj = sn_to_router.get(sn_id)
+                if r_obj:
+                    r_val = f"{r_obj.name} (GW: {r_obj.external_gateway_ip or 'None'})"
+                else:
+                    r_val = "[Isolated]"
+
+                row = [s.name, s_status, ip_val, fip_val, net_val, r_val]
+                if verbose:
+                    row.extend([mac_val, sg_val])
+                rows.append(row)
+
+    if not rows:
+        lines.append("  (No compute instances found)")
+    else:
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+        widths = [w + 2 for w in widths]
+
+        t_border = "+" + "+".join("-" * w for w in widths) + "+"
+        t_hdr = "|" + "|".join(f" {h.center(w - 2)} " for h, w in zip(headers, widths)) + "|"
+
+        lines.append(t_border)
+        lines.append(t_hdr)
+        lines.append(t_border)
+        for row in rows:
+            line_cells = []
+            for i, cell in enumerate(row):
+                if i in (1, 3):
+                    line_cells.append(f" {cell.center(widths[i] - 2)} ")
+                else:
+                    line_cells.append(f" {cell.ljust(widths[i] - 2)} ")
+            lines.append("|" + "|".join(line_cells) + "|")
+        lines.append(t_border)
+
+    lines.append("")
     return "\n".join(lines)
 
 
 def render_json(topo: Topology) -> str:
     """Exports structured topology JSON (Horizon compatible)."""
     return json.dumps(asdict(topo), indent=2, default=str)
-
-
-def _safe_id(prefix: str, raw_id: str) -> str:
-    """Creates a syntax-safe identifier for Graphviz DOT and Mermaid."""
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", str(raw_id))
-    return f"{prefix}_{sanitized}"
 
 
 def render_dot(topo: Topology) -> str:
@@ -626,12 +975,12 @@ def render_dot(topo: Topology) -> str:
 
     for ext_id, ext in topo.external_networks.items():
         node_id = _safe_id("net", ext_id)
-        label = f"{ext.name}\\n[External Network]"
+        label = f"{_dot_escape(ext.name)}\\n[External Network]"
         lines.append(f'  "{node_id}" [label="{label}", fillcolor="#D0E1FD", color="#4285F4", shape=ellipse];')
 
     for r_id, r in topo.routers.items():
         node_id = _safe_id("router", r_id)
-        label = f"Router: {r.name}\\nGW: {r.external_gateway_ip or 'None'}\\n[{r.status}]"
+        label = f"Router: {_dot_escape(r.name)}\\nGW: {r.external_gateway_ip or 'None'}\\n[{r.status}]"
         lines.append(f'  "{node_id}" [label="{label}", fillcolor="#FFF3C4", color="#F9AB00"];')
         if r.external_network_id:
             ext_node = _safe_id("net", r.external_network_id)
@@ -640,7 +989,7 @@ def render_dot(topo: Topology) -> str:
     for net_id, net in topo.tenant_networks.items():
         for sn in net.subnets:
             sn_node = _safe_id("subnet", sn.id)
-            label = f"Subnet: {net.name}\\n{sn.cidr}\\nGW: {sn.gateway_ip}"
+            label = f"Subnet: {_dot_escape(net.name)}\\n{sn.cidr}\\nGW: {sn.gateway_ip}"
             lines.append(f'  "{sn_node}" [label="{label}", fillcolor="#CEEAD6", color="#34A853"];')
 
     for r in topo.routers.values():
@@ -652,7 +1001,8 @@ def render_dot(topo: Topology) -> str:
     for s_id, s in topo.servers.items():
         vm_node = _safe_id("vm", s_id)
         fill = "#FFFFFF" if s.status == "ACTIVE" else "#E8EAED"
-        label = f"VM: {s.name}\\n[{s.status}]"
+        status_label = s.status if not s.task_state else f"{s.status} ({s.task_state})"
+        label = f"VM: {_dot_escape(s.name)}\\n[{status_label}]"
         lines.append(f'  "{vm_node}" [label="{label}", fillcolor="{fill}", color="#5F6368"];')
         for p in s.ports:
             for fip in p.fixed_ips:
@@ -675,24 +1025,46 @@ def render_mermaid(topo: Topology) -> str:
 
     for ext_id, ext in topo.external_networks.items():
         ext_node = _safe_id("EXT", ext_id)
-        lines.append(f'    {ext_node}["🌐 External: {ext.name}"]')
+        lines.append(f'    {ext_node}["🌐 External: {_mermaid_escape(ext.name)}"]')
+
+    declared_subnets: Set[str] = set()
 
     for r_id, r in topo.routers.items():
         r_node = _safe_id("RTR", r_id)
         gw = f" ({r.external_gateway_ip})" if r.external_gateway_ip else ""
-        lines.append(f'    {r_node}["🔀 Router: {r.name}{gw}"]')
+        lines.append(f'    {r_node}["🔀 Router: {_mermaid_escape(r.name)}{gw}"]')
         if r.external_network_id and r.external_network_id in topo.external_networks:
             ext_node = _safe_id("EXT", r.external_network_id)
             lines.append(f"    {ext_node} --> {r_node}")
 
         for iface in r.interfaces:
             sn_node = _safe_id("SUB", iface.subnet_id)
-            lines.append(f'    {sn_node}["🔌 Subnet: {iface.ip_address}"]')
+            if sn_node not in declared_subnets:
+                t_net = topo.tenant_networks.get(iface.network_id)
+                net_name = t_net.name if t_net else iface.network_id[:8]
+                sn_obj = None
+                if t_net:
+                    for s_candidate in t_net.subnets:
+                        if s_candidate.id == iface.subnet_id:
+                            sn_obj = s_candidate
+                            break
+                cidr_str = f" ({sn_obj.cidr})" if sn_obj else ""
+                lines.append(f'    {sn_node}["🔌 Subnet: {_mermaid_escape(net_name)}{cidr_str}"]')
+                declared_subnets.add(sn_node)
             lines.append(f"    {r_node} --> {sn_node}")
+
+    # Declare any remaining subnets (e.g., isolated / unrouted networks)
+    for net_id, net in topo.tenant_networks.items():
+        for sn in net.subnets:
+            sn_node = _safe_id("SUB", sn.id)
+            if sn_node not in declared_subnets:
+                lines.append(f'    {sn_node}["🔌 Subnet: {_mermaid_escape(net.name)} ({sn.cidr})"]')
+                declared_subnets.add(sn_node)
 
     for s_id, s in topo.servers.items():
         vm_node = _safe_id("VM", s_id)
-        lines.append(f'    {vm_node}["🖥️  VM: {s.name} ({s.status})"]')
+        status_str = f"{s.status}" + (f" ({s.task_state})" if s.task_state else "")
+        lines.append(f'    {vm_node}["🖥️  VM: {_mermaid_escape(s.name)} ({status_str})"]')
         for p in s.ports:
             for fip in p.fixed_ips:
                 sn_node = _safe_id("SUB", fip.get("subnet_id", ""))
@@ -708,7 +1080,7 @@ def render_mermaid(topo: Topology) -> str:
 # Mock Data Generator (for offline verification)
 # ==============================================================================
 
-def get_mock_topology() -> Topology:
+def get_mock_topology(all_external: bool = False) -> Topology:
     """Creates a realistic sample topology matching Horizon test fixtures."""
     raw_networks = [
         {
@@ -726,6 +1098,7 @@ def get_mock_topology() -> Topology:
             "router:external": False,
             "mtu": 1442,
             "provider:network_type": "geneve",
+            "provider:segmentation_id": 1024,
         },
         {
             "id": "tenant-net-uuid-102",
@@ -734,6 +1107,7 @@ def get_mock_topology() -> Topology:
             "router:external": False,
             "mtu": 1442,
             "provider:network_type": "geneve",
+            "provider:segmentation_id": 1025,
         },
         {
             "id": "tenant-net-uuid-103",
@@ -742,6 +1116,16 @@ def get_mock_topology() -> Topology:
             "router:external": False,
             "mtu": 1442,
             "provider:network_type": "geneve",
+            "provider:segmentation_id": 1026,
+        },
+        {
+            "id": "ext-net-uuid-unused-002",
+            "name": "public-alt-vlan200",
+            "status": "ACTIVE",
+            "router:external": True,
+            "mtu": 1500,
+            "provider:network_type": "vlan",
+            "provider:segmentation_id": 200,
         },
     ]
 
@@ -752,6 +1136,14 @@ def get_mock_topology() -> Topology:
             "network_id": "ext-net-uuid-001",
             "cidr": "192.168.1.0/24",
             "gateway_ip": "192.168.1.1",
+            "enable_dhcp": False,
+        },
+        {
+            "id": "ext-sn-uuid-002",
+            "name": "alt-public-subnet",
+            "network_id": "ext-net-uuid-unused-002",
+            "cidr": "10.200.0.0/24",
+            "gateway_ip": "10.200.0.1",
             "enable_dhcp": False,
         },
         {
@@ -834,6 +1226,7 @@ def get_mock_topology() -> Topology:
             "fixed_ips": [{"ip_address": "10.0.1.15", "subnet_id": "app-sn-uuid-101"}],
             "mac_address": "fa:16:3e:20:01:15",
             "status": "ACTIVE",
+            "security_groups": ["secgroup-web", "secgroup-default"],
         },
         {
             "id": "port-vm-02",
@@ -844,6 +1237,7 @@ def get_mock_topology() -> Topology:
             "fixed_ips": [{"ip_address": "10.0.1.16", "subnet_id": "app-sn-uuid-101"}],
             "mac_address": "fa:16:3e:20:01:16",
             "status": "ACTIVE",
+            "security_groups": ["secgroup-web"],
         },
         {
             "id": "port-vm-03",
@@ -854,6 +1248,7 @@ def get_mock_topology() -> Topology:
             "fixed_ips": [{"ip_address": "10.0.2.20", "subnet_id": "db-sn-uuid-102"}],
             "mac_address": "fa:16:3e:20:02:20",
             "status": "ACTIVE",
+            "security_groups": ["secgroup-db"],
         },
         {
             "id": "port-vm-04",
@@ -864,14 +1259,15 @@ def get_mock_topology() -> Topology:
             "fixed_ips": [{"ip_address": "172.16.50.5", "subnet_id": "backup-sn-uuid-103"}],
             "mac_address": "fa:16:3e:30:50:05",
             "status": "ACTIVE",
+            "security_groups": ["secgroup-backup"],
         },
     ]
 
     raw_servers = [
-        {"id": "server-uuid-001", "name": "web-frontend-01", "status": "ACTIVE"},
-        {"id": "server-uuid-002", "name": "web-frontend-02", "status": "ACTIVE"},
-        {"id": "server-uuid-003", "name": "db-cluster-01", "status": "ACTIVE"},
-        {"id": "server-uuid-004", "name": "backup-runner", "status": "SHUTOFF"},
+        {"id": "server-uuid-001", "name": "web-frontend-01", "status": "ACTIVE", "task_state": None},
+        {"id": "server-uuid-002", "name": "web-frontend-02", "status": "ACTIVE", "task_state": None},
+        {"id": "server-uuid-003", "name": "db-cluster-01", "status": "ACTIVE", "task_state": None},
+        {"id": "server-uuid-004", "name": "backup-runner", "status": "SHUTOFF", "task_state": "powering-off"},
     ]
 
     raw_floating_ips = [
@@ -879,6 +1275,7 @@ def get_mock_topology() -> Topology:
             "id": "fip-uuid-001",
             "floating_ip_address": "192.168.1.150",
             "fixed_ip_address": "10.0.1.15",
+            "floating_network_id": "ext-net-uuid-001",
             "port_id": "port-vm-01",
             "status": "ACTIVE",
         }
@@ -895,6 +1292,7 @@ def get_mock_topology() -> Topology:
         project_name="demo",
         auth_url="https://overcloud.local:13000/v3",
         region_name="regionOne",
+        all_external=all_external,
     )
 
 
@@ -906,13 +1304,14 @@ def collect_live_openstack_topology(
     cloud_name: Optional[str] = None,
     target_project: Optional[str] = None,
     insecure: bool = False,
+    all_external: bool = False,
 ) -> Topology:
     """Connects to OpenStack via openstacksdk and extracts topology data."""
     try:
         import openstack
-    except ImportError:
-        print(
-            "Error: 'openstacksdk' is not installed.\n"
+    except ImportError as e:
+        raise OpenStackSDKMissingError(
+            "'openstacksdk' is not installed.\n"
             "Install options:\n"
             "  Debian / Ubuntu:\n"
             "    sudo apt install -y python3-openstacksdk\n"
@@ -920,10 +1319,8 @@ def collect_live_openstack_topology(
             "    sudo dnf install -y python3-openstacksdk\n"
             "  Virtual environment / pip:\n"
             "    pip install -r requirements.txt\n"
-            "\nTip: You can test the script right now with: python3 ovn_tenant_topology.py --mock",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+            "\nTip: You can test the script right now with: python3 ovn_tenant_topology.py --mock"
+        ) from e
 
     env_insecure = os.environ.get("OS_INSECURE", "").lower() in ("1", "true", "yes")
     verify_ssl = not (insecure or env_insecure)
@@ -938,9 +1335,7 @@ def collect_live_openstack_topology(
         else:
             conn = openstack.connect(verify=verify_ssl)
     except Exception as e:
-        print(f"Error establishing OpenStack connection: {e}", file=sys.stderr)
-        print("Ensure you have sourced your Director RC file (e.g., 'source overcloudrc')", file=sys.stderr)
-        sys.exit(1)
+        raise ConnectionConfigError(f"Error establishing OpenStack connection: {e}") from e
 
     current_proj_id = conn.current_project_id
     if target_project:
@@ -949,8 +1344,7 @@ def collect_live_openstack_topology(
             project_id = proj.id
             project_name = proj.name
         except Exception as e:
-            print(f"Error finding project '{target_project}': {e}", file=sys.stderr)
-            sys.exit(1)
+            raise ProjectNotFoundError(f"Error finding project '{target_project}': {e}") from e
     else:
         project_id = current_proj_id or os.environ.get("OS_PROJECT_ID") or os.environ.get("OS_TENANT_ID") or ""
         project_name = os.environ.get("OS_PROJECT_NAME") or os.environ.get("OS_TENANT_NAME") or project_id
@@ -963,15 +1357,34 @@ def collect_live_openstack_topology(
         tenant_nets = list(conn.network.networks(project_id=project_id))
         all_nets = {n.id: n.to_dict() for n in (ext_nets + tenant_nets)}
 
-        subnets = [s.to_dict() for s in conn.network.subnets()]
+        # Scoped subnets: fetch tenant subnets, plus subnets for external networks
+        tenant_subnets = list(conn.network.subnets(project_id=project_id))
+        ext_subnets = []
+        for ext_net in ext_nets:
+            try:
+                ext_subnets.extend(list(conn.network.subnets(network_id=ext_net.id)))
+            except Exception:
+                pass
+
+        all_subnets_map = {s.id: s.to_dict() for s in (tenant_subnets + ext_subnets)}
+        if not all_subnets_map:
+            all_subnets_map = {s.id: s.to_dict() for s in conn.network.subnets()}
+        subnets = list(all_subnets_map.values())
+
         routers = [r.to_dict() for r in conn.network.routers(project_id=project_id)]
         ports = [p.to_dict() for p in conn.network.ports(project_id=project_id)]
         fips = [f.to_dict() for f in conn.network.ips(project_id=project_id)]
-        servers = [s.to_dict() for s in conn.compute.servers(project_id=project_id)]
+
+        server_kwargs: Dict[str, Any] = {"project_id": project_id}
+        if target_project:
+            server_kwargs["all_projects"] = True
+        try:
+            servers = [s.to_dict() for s in conn.compute.servers(**server_kwargs)]
+        except Exception:
+            servers = [s.to_dict() for s in conn.compute.servers(project_id=project_id)]
 
     except Exception as e:
-        print(f"Error querying OpenStack APIs: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise TopologyQueryError(f"Error querying OpenStack APIs: {e}") from e
 
     return build_topology_from_data(
         raw_networks=list(all_nets.values()),
@@ -984,6 +1397,7 @@ def collect_live_openstack_topology(
         project_name=project_name,
         auth_url=auth_url,
         region_name=region_name,
+        all_external=all_external,
     )
 
 
@@ -991,7 +1405,7 @@ def collect_live_openstack_topology(
 # CLI Entrypoint
 # ==============================================================================
 
-def main():
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Horizon Tenant OVN Network Topology CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1003,10 +1417,9 @@ Examples:
   # Test offline with mock data:
   python3 ovn_tenant_topology.py --mock
 
-  # Output in plain ASCII (for scripts/logs):
+  # Output formats:
   python3 ovn_tenant_topology.py --format ascii
-
-  # Export to JSON:
+  python3 ovn_tenant_topology.py --format table
   python3 ovn_tenant_topology.py --format json
 
   # Export to Graphviz DOT and generate SVG:
@@ -1020,7 +1433,7 @@ Examples:
     parser.add_argument(
         "-f",
         "--format",
-        choices=["tree", "ascii", "json", "dot", "mermaid"],
+        choices=["tree", "ascii", "table", "json", "dot", "mermaid"],
         default="tree",
         help="Output format (default: tree)",
     )
@@ -1043,7 +1456,7 @@ Examples:
     parser.add_argument(
         "--ovn-details",
         action="store_true",
-        help="Include OVN logical switch and logical router IDs in tree output",
+        help="Include OVN logical switch and logical router IDs in output",
     )
     parser.add_argument(
         "--no-color",
@@ -1054,7 +1467,12 @@ Examples:
         "-v",
         "--verbose",
         action="store_true",
-        help="Show additional port MAC addresses and details",
+        help="Show additional port MAC addresses, security groups, and details",
+    )
+    parser.add_argument(
+        "--all-external-networks",
+        action="store_true",
+        help="Show all cloud external networks, even if disconnected from tenant",
     )
     parser.add_argument(
         "--mock",
@@ -1062,34 +1480,59 @@ Examples:
         help="Run using mock topology data without connecting to OpenStack",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    use_colors = not args.no_color and sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    # NO_COLOR specification adherence: https://no-color.org
+    no_color_env = bool(os.environ.get("NO_COLOR"))
+    is_dumb_term = os.environ.get("TERM") == "dumb"
+    use_colors = not args.no_color and not no_color_env and not is_dumb_term and sys.stdout.isatty()
     colors = Colors(enabled=use_colors)
 
-    if args.mock:
-        topo = get_mock_topology()
-    else:
-        if not args.cloud and "OS_AUTH_URL" not in os.environ:
-            print(
-                "Notice: No OS_AUTH_URL environment variable detected and no --cloud provided.\n"
-                "To connect to an OpenStack Director cloud, please run:\n"
-                "  $ source ~/overcloudrc (or your tenant rc file)\n"
-                "\nFalling back to --mock mode to show sample topology:\n",
-                file=sys.stderr,
-            )
-            topo = get_mock_topology()
+    try:
+        if args.mock:
+            topo = get_mock_topology(all_external=args.all_external_networks)
         else:
-            topo = collect_live_openstack_topology(
-                cloud_name=args.cloud,
-                target_project=args.project,
-                insecure=args.insecure,
-            )
+            if not args.cloud and "OS_AUTH_URL" not in os.environ:
+                print(
+                    "Notice: No OS_AUTH_URL environment variable detected and no --cloud provided.\n"
+                    "To connect to an OpenStack Director cloud, please run:\n"
+                    "  $ source ~/overcloudrc (or your tenant rc file)\n"
+                    "\nFalling back to --mock mode to show sample topology:\n",
+                    file=sys.stderr,
+                )
+                topo = get_mock_topology(all_external=args.all_external_networks)
+            else:
+                topo = collect_live_openstack_topology(
+                    cloud_name=args.cloud,
+                    target_project=args.project,
+                    insecure=args.insecure,
+                    all_external=args.all_external_networks,
+                )
+    except OpenStackSDKMissingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except ConnectionConfigError as e:
+        print(
+            f"{e}\nEnsure you have sourced your Director RC file (e.g., 'source overcloudrc')",
+            file=sys.stderr,
+        )
+        return 1
+    except ProjectNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except TopologyQueryError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        return 1
 
     if args.format == "tree":
         output = render_tree(topo, colors, ovn_details=args.ovn_details, verbose=args.verbose)
     elif args.format == "ascii":
-        output = render_ascii(topo, ovn_details=args.ovn_details)
+        output = render_ascii(topo, ovn_details=args.ovn_details, verbose=args.verbose)
+    elif args.format == "table":
+        output = render_table(topo, colors, verbose=args.verbose)
     elif args.format == "json":
         output = render_json(topo)
     elif args.format == "dot":
@@ -1100,7 +1543,8 @@ Examples:
         output = render_tree(topo, colors)
 
     print(output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

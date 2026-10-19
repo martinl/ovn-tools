@@ -9,28 +9,32 @@ Designed for **OpenStack Director (TripleO / Undercloud / Overcloud)**, standalo
 ## Features
 
 - 🖥️ **Terminal-First Visual Graph**: Reconstructs the hierarchy of External Networks, Routers, Subnets, VM instances, and Floating IPs in an intuitive Unicode tree with ANSI color coding.
-- ⚡ **OVN Integration**: Automatically correlates Neutron networks and routers with their underlying OVN logical entities (`neutron-<id>` Logical Switches and Logical Routers in OVN Northbound/Southbound databases).
+- ⚡ **OVN Integration**: Automatically correlates Neutron networks and routers with their underlying OVN logical entities (`neutron-<id>` Logical Switches and Logical Routers in OVN Northbound/Southbound databases) and shows encapsulation info (`geneve:1024`, `vlan:100`).
 - 🔄 **Multiple Output Formats**:
-  - `tree` *(default)*: Rich colored Unicode tree with status badges (`[ACTIVE]`, `[SHUTOFF]`, `[ERROR]`).
+  - `tree` *(default)*: Rich colored Unicode tree with status badges (`[ACTIVE]`, `[SHUTOFF]`, `[ERROR]`), task state, and floating IP paths.
+  - `table`: Clean aligned ASCII resource summary card and workload routing path table.
   - `ascii`: Plain-text ASCII tree suitable for log files, text editors, or terminals lacking Unicode support.
   - `mermaid`: Markdown flowchart diagrams ready for GitHub, GitLab, and documentation wikis.
   - `dot`: Graphviz DOT format to generate publication-grade SVG, PNG, or PDF network diagrams.
   - `json`: Structured JSON export conforming to Horizon topology data models.
 - 🔒 **OpenStack & Director Authentication**: Seamlessly works with standard `overcloudrc` / `keystonerc` environment variables, `clouds.yaml`, and supports self-signed SSL endpoints (`--insecure`).
-- 👥 **Multi-Tenant Administration**: Inspect specific tenant topologies with `--project <name_or_uuid>` when using administrative credentials.
+- 👥 **Multi-Tenant Administration**: Inspect specific tenant topologies with `--project <name_or_uuid>` with proper Nova admin scoping (`all_projects=True`).
 - 📦 **Isolated Network Detection**: Highlights unrouted / isolated networks and attached workloads that lack router interfaces.
+- 🌐 **External Network Scoping**: Filters out unconnected cloud provider networks by default, with `--all-external-networks` to reveal all.
 - 🧪 **Offline & Mock Mode**: Includes built-in realistic mock data generator (`--mock`) for local development, demos, and testing without an active OpenStack cloud.
+- 📦 **Standard Packaging**: Full PEP 517/621 `pyproject.toml` support providing the `ovn-tenant-topology` CLI command.
 
 ---
 
 ## Architecture & Codebase Overview
 
-The codebase consists of two primary files:
-
 ```text
-ovn-tenant-topology/
+ovn-tools/
 ├── ovn_tenant_topology.py       # Core application (Collector, Engine, Renderers, CLI)
-├── test_ovn_tenant_topology.py  # Unit test suite covering models and all renderers
+├── test_ovn_tenant_topology.py  # Comprehensive test suite covering all renderers & edge cases
+├── pyproject.toml               # PEP 517/621 packaging & console script definition
+├── requirements.txt             # Minimal pip dependencies
+├── .github/workflows/test.yml   # Multi-version CI testing (Python 3.8 - 3.13)
 └── README.md                    # Project documentation
 ```
 
@@ -45,8 +49,8 @@ ovn-tenant-topology/
                                           ▼
                       ┌────────────────────────────────────────┐
                       │    collect_live_openstack_topology()   │
-                      │  Extracts Nets, Subnets, Routers,      │
-                      │  Ports, Floating IPs, and Servers      │
+                      │  - Scoped subnets & admin Nova query   │
+                      │  - External network association        │
                       └───────────────────┬────────────────────┘
                                           │
                                           ▼
@@ -66,34 +70,12 @@ ovn-tenant-topology/
                       │  ServerInfo, NetworkInfo, RouterInfo   │
                       └───────────────────┬────────────────────┘
                                           │
-            ┌──────────────┬──────────────┼──────────────┬──────────────┐
-            ▼              ▼              ▼              ▼              ▼
-     ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
-     │render_tree │ │render_ascii│ │render_json │ │ render_dot │ │render_merm.│
-     └────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘
+      ┌────────────┬────────────┬─────────┼──────────┬────────────┬────────────┐
+      ▼            ▼            ▼         ▼          ▼            ▼            ▼
+ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+ │render_tree│render_asci│render_tabl│render_json│render_dot │render_merm│
+ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘
 ```
-
-### Components
-
-1. **Data Models (`dataclasses`)**:
-   - `SubnetInfo`: Represents CIDRs, gateway IPs, DHCP states, and IP allocation pools.
-   - `PortInfo`: Represents neutron ports, fixed IPs, MAC addresses, device owners, and associated Floating IPs.
-   - `ServerInfo`: Represents compute instances (VMs), current status (`ACTIVE`, `SHUTOFF`, etc.), and connected ports.
-   - `NetworkInfo`: Represents tenant and external networks, MTUs, segmentation IDs, and provides `ovn_logical_switch` property (`neutron-<id>`).
-   - `RouterInfo`: Represents neutron routers, external gateway IPs, SNAT status, router interfaces, and provides `ovn_logical_router` property (`neutron-<id>`).
-   - `Topology`: Top-level graph model aggregating all interconnected components for a tenant.
-
-2. **Graph Reconciliation Engine (`build_topology_from_data`)**:
-   - Maps ports by device ownership (e.g. `compute:nova`, `network:router_interface`).
-   - Pairs floating IPs with target compute instances.
-   - Categorizes external vs. tenant networks and identifies isolated networks with no router interfaces attached.
-
-3. **Renderers**:
-   - `render_tree`: Colored Unicode hierarchy with gateway IP, SNAT state, floating IP pointers, and status badges.
-   - `render_ascii`: ASCII tree representation for terminal pipelines and loggers.
-   - `render_json`: Complete JSON dump compatible with API consumers.
-   - `render_dot`: Graphviz DOT syntax using color-coded shapes (ellipses for external nets, boxes for routers/VMs).
-   - `render_mermaid`: Mermaid markdown code block for documentation diagrams.
 
 ---
 
@@ -103,77 +85,56 @@ ovn-tenant-topology/
 
 - **Python**: 3.8 or newer
 - **OpenStack SDK**: `openstacksdk` (only required when connecting to live OpenStack environments; `--mock` runs with zero third-party dependencies).
-- **Graphviz** *(optional)*: For compiling DOT diagrams into images:
-  - **Debian / Ubuntu**: `sudo apt install -y graphviz`
-  - **RHEL / CentOS**: `sudo dnf install -y graphviz`
-  - **macOS**: `brew install graphviz`
+- **Graphviz** *(optional)*: For compiling DOT diagrams into images (`sudo apt install graphviz` / `brew install graphviz`).
 
 ---
 
 ### Setup Guide
 
-#### Debian / Ubuntu
+#### Option 1: Install as a CLI Tool via pip (Recommended)
 
-##### Option 1: Virtual Environment (Recommended)
-On modern Debian (12+) and Ubuntu (22.04 / 24.04+), Python's `venv` package is separate and PEP 668 restricts non-venv global pip installs.
-
-1. **Install Python venv and pip prerequisites:**
-   ```bash
-   sudo apt update
-   sudo apt install -y python3-venv python3-pip
-   ```
-
-2. **Create and activate a virtual environment:**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-3. **Install project requirements:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-##### Option 2: System Package (No Virtual Environment Needed)
-Install `python3-openstacksdk` directly from apt repositories:
 ```bash
-sudo apt update
-sudo apt install -y python3-openstacksdk
+git clone https://github.com/martinl/ovn-tools.git
+cd ovn-tools
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
 ```
 
----
-
-#### RHEL / CentOS / OpenStack Director
-
-##### Option 1: Virtual Environment
+After installation, the tool is directly available in your terminal:
 ```bash
+ovn-tenant-topology --mock
+```
+
+#### Option 2: Run Directly from Source
+
+```bash
+git clone https://github.com/martinl/ovn-tools.git
+cd ovn-tools
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python3 ovn_tenant_topology.py --mock
 ```
 
-##### Option 2: System Package
-```bash
-sudo dnf install -y python3-openstacksdk
-```
+#### Option 3: System Package on Linux (No venv needed)
 
----
-
-#### macOS / Other Platforms
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+- **Debian / Ubuntu**:
+  ```bash
+  sudo apt update && sudo apt install -y python3-openstacksdk
+  python3 ovn_tenant_topology.py --mock
+  ```
+- **RHEL / CentOS / OpenStack Director**:
+  ```bash
+  sudo dnf install -y python3-openstacksdk
+  python3 ovn_tenant_topology.py --mock
+  ```
 
 ---
 
 ## Quickstart
 
 ### 1. Test Instantly with Mock Data (No OpenStack Required)
-
-You can run the script right now without OpenStack credentials to test all features:
 
 ```bash
 python3 ovn_tenant_topology.py --mock
@@ -188,20 +149,20 @@ Region: regionOne | Auth URL: https://overcloud.local:13000/v3
 
 🌐 External Network: public (192.168.1.0/24) [ACTIVE]
 └── 🔀 Router: tenant-gateway-router [ACTIVE] (Gateway: 192.168.1.105 | SNAT: enabled)
-    ├── 🔌 Subnet: app-internal-net / 10.0.1.0/24 (GW: 10.0.1.1)
+    ├── 🔌 Subnet: app-internal-net / 10.0.1.0/24 (GW: 10.0.1.1) [geneve:1024]
     │   ├── 🖥️  web-frontend-01 [ACTIVE] [10.0.1.15] ➜ 🌐 Floating IP: 192.168.1.150
     │   └── 🖥️  web-frontend-02 [ACTIVE] [10.0.1.16]
-    └── 🔌 Subnet: db-backend-net / 10.0.2.0/24 (GW: 10.0.2.1)
+    └── 🔌 Subnet: db-backend-net / 10.0.2.0/24 (GW: 10.0.2.1) [geneve:1025]
         └── 🖥️  db-cluster-01 [ACTIVE] [10.0.2.20]
 
 📦 Isolated / Unrouted Networks (No Router Interface):
-└── 🔌 Network: isolated-backup-net [ACTIVE] [backup-subnet (172.16.50.0/24)]
-    └── 🖥️  backup-runner [SHUTOFF] [172.16.50.5]
+└── 🔌 Network: isolated-backup-net [ACTIVE] [backup-subnet (172.16.50.0/24)] [geneve:1026]
+    └── 🖥️  backup-runner [SHUTOFF (powering-off)] [172.16.50.5]
 ```
 
 ### 2. Connect to an OpenStack Environment
 
-Source your OpenStack RC file (e.g., Director overcloudrc or project RC):
+Source your OpenStack RC file:
 
 ```bash
 source ~/overcloudrc
@@ -209,12 +170,12 @@ source ~/overcloudrc
 source ~/myprojectrc
 
 # Run the CLI
-python3 ovn_tenant_topology.py
+ovn-tenant-topology
 ```
 
 If your OpenStack deployment uses self-signed SSL certificates:
 ```bash
-python3 ovn_tenant_topology.py --insecure
+ovn-tenant-topology --insecure
 ```
 
 ---
@@ -222,29 +183,67 @@ python3 ovn_tenant_topology.py --insecure
 ## CLI Usage & Options
 
 ```text
-usage: ovn_tenant_topology.py [-h] [-f {tree,ascii,json,dot,mermaid}]
-                             [--project PROJECT] [--cloud CLOUD_NAME] [-k]
-                             [--ovn-details] [--no-color] [-v] [--mock]
+usage: ovn_tenant_topology.py [-h] [-f {tree,ascii,table,json,dot,mermaid}]
+                              [--project PROJECT] [--cloud CLOUD_NAME] [-k]
+                              [--ovn-details] [--no-color] [-v]
+                              [--all-external-networks] [--mock]
 ```
 
 | Flag | Description |
 |---|---|
-| `-f, --format FORMAT` | Output format: `tree` (default), `ascii`, `json`, `dot`, `mermaid` |
-| `--project PROJECT` | Target project name or UUID (requires admin credentials) |
+| `-f, --format FORMAT` | Output format: `tree` (default), `ascii`, `table`, `json`, `dot`, `mermaid` |
+| `--project PROJECT` | Target project name or UUID (uses `all_projects=True` for admin credentials) |
 | `--cloud CLOUD_NAME` | Named cloud entry defined in `~/.config/openstack/clouds.yaml` |
 | `-k, --insecure` | Explicitly trust self-signed / untrusted SSL certificates |
-| `--ovn-details` | Include OVN logical switch (`neutron-<net_id>`) and logical router (`neutron-<rtr_id>`) identifiers |
-| `-v, --verbose` | Show additional port details such as MAC addresses |
-| `--no-color` | Disable ANSI color sequences in output |
+| `--ovn-details` | Include OVN logical switch (`neutron-<net_id>`), logical router (`neutron-<rtr_id>`), encapsulation, and port LSP identifiers |
+| `-v, --verbose` | Show additional port details (MAC addresses, security groups) and VM task state |
+| `--all-external-networks` | Show all cloud external networks, even if not connected to the tenant's routers |
+| `--no-color` | Disable ANSI color sequences in output (also honors the standard `NO_COLOR` env var) |
 | `--mock` | Run with sample topology data without querying OpenStack |
 
 ---
 
-## Usage Examples
+## Output Format Examples
 
-### 1. Inspect OVN Logical Entities
+### 1. Tabular Workload Inventory (`--format table`)
 
-Add `--ovn-details` to view the underlying OVN logical switches and routers:
+```bash
+python3 ovn_tenant_topology.py --mock --format table
+```
+
+Output:
+```text
+========================================================================================
+OpenStack Tenant Network Topology Overview | Project: demo (demo-tenant-4a8b-1234)
+Region: regionOne | Auth URL: https://overcloud.local:13000/v3
+========================================================================================
+
+RESOURCE SUMMARY:
++----------+---------+-------------+---------------+---------+-----------+--------------+
+| Ext Nets | Routers | Tenant Nets | Isolated Nets | Subnets | Instances | Floating IPs |
++----------+---------+-------------+---------------+---------+-----------+--------------+
+|    1     |    1    |      3      |       1       |    3    |     4     |      1       |
++----------+---------+-------------+---------------+---------+-----------+--------------+
+
+WORKLOAD INVENTORY & ROUTING PATH:
++-----------------+------------------------+-------------+---------------+--------------------------------------+-------------------------------------------+
+|     Instance    |         Status         | Fixed IP(s) |  Floating IP  |            Network / CIDR            |               Router Gateway              |
++-----------------+------------------------+-------------+---------------+--------------------------------------+-------------------------------------------+
+| backup-runner   | SHUTOFF (powering-off) | 172.16.50.5 |       -       | isolated-backup-net (172.16.50.0/24) | [Isolated]                                |
+| db-cluster-01   |         ACTIVE         | 10.0.2.20   |       -       | db-backend-net (10.0.2.0/24)         | tenant-gateway-router (GW: 192.168.1.105) |
+| web-frontend-01 |         ACTIVE         | 10.0.1.15   | 192.168.1.150 | app-internal-net (10.0.1.0/24)       | tenant-gateway-router (GW: 192.168.1.105) |
+| web-frontend-02 |         ACTIVE         | 10.0.1.16   |       -       | app-internal-net (10.0.1.0/24)       | tenant-gateway-router (GW: 192.168.1.105) |
++-----------------+------------------------+-------------+---------------+--------------------------------------+-------------------------------------------+
+```
+
+Add `-v` to include MAC Addresses and Security Groups:
+```bash
+python3 ovn_tenant_topology.py --mock --format table -v
+```
+
+### 2. Inspect OVN Logical Entities
+
+Add `--ovn-details` to view underlying OVN logical switches, logical routers, and encapsulation:
 
 ```bash
 python3 ovn_tenant_topology.py --ovn-details
@@ -253,19 +252,17 @@ python3 ovn_tenant_topology.py --ovn-details
 Output includes:
 ```text
 └── 🔀 Router: tenant-gateway-router [ACTIVE] (...) [OVN LR: neutron-router-uuid-001]
-    ├── 🔌 Subnet: app-internal-net / 10.0.1.0/24 (...) [OVN LS: neutron-tenant-net-uuid-101]
+    ├── 🔌 Subnet: app-internal-net / 10.0.1.0/24 (...) [geneve:1024] [OVN LS: neutron-tenant-net-uuid-101]
 ```
 
-You can then directly correlate these with OVN CLI utilities on your controller/hypervisor:
+Correlate directly with OVN utilities on controller nodes:
 ```bash
 sudo ovn-nbctl show neutron-router-uuid-001
 sudo ovn-nbctl lr-nat-list neutron-router-uuid-001
 sudo ovn-sbctl show
 ```
 
-### 2. Generate Graphviz SVG / PNG Network Diagrams
-
-Export the topology to DOT and pipe into Graphviz:
+### 3. Generate Graphviz SVG / PNG Network Diagrams
 
 ```bash
 # Render to SVG
@@ -275,56 +272,37 @@ python3 ovn_tenant_topology.py --format dot | dot -Tsvg -o topology.svg
 python3 ovn_tenant_topology.py --format dot | dot -Tpng -o topology.png
 ```
 
-### 3. Generate Mermaid Diagrams for Markdown
+### 4. Generate Mermaid Diagrams for Markdown
 
 ```bash
-python3 ovn_tenant_topology.py --format mermaid > topology.md
+python3 ovn_tenant_topology.py --format mermaid
 ```
 
-Generates:
-```mermaid
-graph TD
-    EXT_ext_net_uuid_001["🌐 External: public"]
-    RTR_router_uuid_001["🔀 Router: tenant-gateway-router (192.168.1.105)"]
-    EXT_ext_net_uuid_001 --> RTR_router_uuid_001
-    SUB_app_sn_uuid_101["🔌 Subnet: 10.0.1.1"]
-    RTR_router_uuid_001 --> SUB_app_sn_uuid_101
-    SUB_db_sn_uuid_102["🔌 Subnet: 10.0.2.1"]
-    RTR_router_uuid_001 --> SUB_db_sn_uuid_102
-    VM_server_uuid_001["🖥️  VM: web-frontend-01 (ACTIVE)"]
-    SUB_app_sn_uuid_101 -->|"10.0.1.15 / FIP: 192.168.1.150"| VM_server_uuid_001
-    VM_server_uuid_002["🖥️  VM: web-frontend-02 (ACTIVE)"]
-    SUB_app_sn_uuid_101 -->|"10.0.1.16"| VM_server_uuid_002
-    VM_server_uuid_003["🖥️  VM: db-cluster-01 (ACTIVE)"]
-    SUB_db_sn_uuid_102 -->|"10.0.2.20"| VM_server_uuid_003
-    VM_server_uuid_004["🖥️  VM: backup-runner (SHUTOFF)"]
-    SUB_backup_sn_uuid_103 -->|"172.16.50.5"| VM_server_uuid_004
-```
-
-### 4. Plain ASCII for Automated Log Files
+### 5. Plain ASCII for Automated Log Files
 
 ```bash
-python3 ovn_tenant_topology.py --format ascii
+python3 ovn_tenant_topology.py --format ascii --ovn-details -v
 ```
 
 Output:
 ```text
 === OpenStack Tenant Topology: demo (demo-tenant-4a8b-1234) ===
+Region: regionOne | Auth URL: https://overcloud.local:13000/v3
 
 [EXT: public] (192.168.1.0/24) [ACTIVE]
-  \-- [ROUTER: tenant-gateway-router] [ACTIVE] (GW: 192.168.1.105, snat:on)
-      +-- [SUBNET: app-internal-net] (IP: 10.0.1.1)
-      |   +-- [VM: web-frontend-01] [ACTIVE] (IP: 10.0.1.15) <=> [FIP: 192.168.1.150]
-      |   \-- [VM: web-frontend-02] [ACTIVE] (IP: 10.0.1.16)
-      \-- [SUBNET: db-backend-net] (IP: 10.0.2.1)
-          \-- [VM: db-cluster-01] [ACTIVE] (IP: 10.0.2.20)
+  \-- [ROUTER: tenant-gateway-router] [ACTIVE] (GW: 192.168.1.105, snat:on) [OVN LR: neutron-router-uuid-001]
+      +-- [SUBNET: app-internal-net] (IP: 10.0.1.1) [OVN LS: neutron-tenant-net-uuid-101]
+      |   +-- [VM: web-frontend-01] [ACTIVE] (IP: 10.0.1.15) (MAC: fa:16:3e:20:01:15) (SG: secgroup-web, secgroup-default) <=> [FIP: 192.168.1.150]
+      |   \-- [VM: web-frontend-02] [ACTIVE] (IP: 10.0.1.16) (MAC: fa:16:3e:20:01:16) (SG: secgroup-web)
+      \-- [SUBNET: db-backend-net] (IP: 10.0.2.1) [OVN LS: neutron-tenant-net-uuid-102]
+          \-- [VM: db-cluster-01] [ACTIVE] (IP: 10.0.2.20) (MAC: fa:16:3e:20:02:20) (SG: secgroup-db)
 
 [ISOLATED NETWORKS]
-  +-- [NET: isolated-backup-net] (172.16.50.0/24)
-      +-- [VM: backup-runner] [SHUTOFF] (IP: 172.16.50.5)
+  +-- [NET: isolated-backup-net] (172.16.50.0/24) [OVN LS: neutron-tenant-net-uuid-103]
+      +-- [VM: backup-runner] [SHUTOFF (powering-off)] (IP: 172.16.50.5) (MAC: fa:16:3e:30:50:05) (SG: secgroup-backup)
 ```
 
-### 5. Export JSON for Scripting
+### 6. Export JSON for Scripting
 
 ```bash
 python3 ovn_tenant_topology.py --format json | jq '.routers'
@@ -334,19 +312,30 @@ python3 ovn_tenant_topology.py --format json | jq '.routers'
 
 ## Running Unit Tests
 
-The repository includes a comprehensive unit test suite in [test_ovn_tenant_topology.py](test_ovn_tenant_topology.py) testing graph model construction, router linkings, floating IPs, isolated subnets, and all rendering format outputs.
-
-Run the tests using Python's standard `unittest` module:
+Run the test suite using Python's standard `unittest` module:
 
 ```bash
-python3 -m unittest test_ovn_tenant_topology.py
+python3 -m unittest -v test_ovn_tenant_topology.py
 ```
 
 Expected output:
 ```text
-......
+test_all_external_networks_toggle ... ok
+test_cli_main_invocations ... ok
+test_colors_and_badges ... ok
+test_custom_exceptions_hierarchy ... ok
+test_edge_case_topologies ... ok
+test_escaping_helpers ... ok
+test_mock_topology_structure ... ok
+test_render_ascii_ovn_and_verbose ... ok
+test_render_dot ... ok
+test_render_json ... ok
+test_render_mermaid ... ok
+test_render_table ... ok
+test_render_tree ... ok
+
 ----------------------------------------------------------------------
-Ran 6 tests in 0.001s
+Ran 13 tests in 0.009s
 
 OK
 ```
